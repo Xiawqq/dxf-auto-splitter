@@ -631,6 +631,26 @@ def _aspect_matches_reference(aspect_ratio, reference_aspects):
     ) <= 0.05
 
 
+_SINGLE_FRAME_MIN_DOMINANT_AREA_RATIO = 0.25
+
+
+def _strong_single_frame_scale_supported(shape, profile, border_families):
+    """Allow a large, strongly bordered singleton with a different aspect."""
+    if not profile.get("nested_border") or not profile.get("thick_inner"):
+        return False
+    reference_areas = [
+        family.get("median_area", 0.0)
+        for family in border_families
+        if family.get("median_area", 0.0) > 0.0
+    ]
+    if not reference_areas:
+        return False
+    dominant_area = max(reference_areas)
+    return shape.get("outer_area", 0.0) >= (
+        dominant_area * _SINGLE_FRAME_MIN_DOMINANT_AREA_RATIO
+    )
+
+
 def _insert_family_summary(block_name, records, block_entity_count, border_profile):
     widths = [record["width"] for record in records]
     heights = [record["height"] for record in records]
@@ -762,20 +782,28 @@ def _detect_insert_frames_with_families(doc):
             if record["entity_handle"] in selected_handles:
                 continue
             shape = _single_frame_shape(doc, block_name)
-            if shape is None or not _aspect_matches_reference(
+            profile = _block_border_profile(doc, block_name)
+            aspect_matches = shape is not None and _aspect_matches_reference(
                 shape["outer_aspect_ratio"], reference_aspects
-            ):
+            )
+            strong_single_frame = shape is not None and _strong_single_frame_scale_supported(
+                shape, profile, border_families
+            )
+            if shape is None or not (aspect_matches or strong_single_frame):
                 continue
 
-            profile = _block_border_profile(doc, block_name)
             candidate = dict(record)
             candidate.update(
                 {
-                    "nested_border": False,
+                    "nested_border": profile.get("nested_border", False),
                     "thick_inner": profile.get("thick_inner", False),
                     "parallel_track": profile.get("parallel_track", False),
                     "nested_depth": profile.get("nested_depth", 0),
-                    "border_evidence": "single_frame_shape_reference",
+                    "border_evidence": (
+                        "single_frame_strong_border"
+                        if strong_single_frame and not aspect_matches
+                        else "single_frame_shape_reference"
+                    ),
                     "size_variant_count": 1,
                     "border_pair": profile.get("pair"),
                     "status": "单次同形图幅候选",
@@ -916,6 +944,16 @@ def _drop_nested_formal_candidates(candidates):
             continue
         selected.append(candidate)
     return selected
+
+
+def _finalize_formal_candidates(candidates):
+    """Apply the common non-nesting rule to every formal-candidate route."""
+    candidates = _deduplicate_candidates(candidates)
+    candidates = _drop_nested_formal_candidates(candidates)
+    candidates.sort(key=lambda item: (-item["bbox"][3], item["bbox"][0]))
+    for index, candidate in enumerate(candidates, start=1):
+        candidate["index"] = index
+    return candidates
 
 
 def _paper_viewport_model_box(viewport):
@@ -1423,12 +1461,7 @@ def detect_frames(doc):
     """Detect formal candidates from paper space before model space."""
     paper_candidates = _paper_layout_frame_candidates(doc)
     if paper_candidates:
-        paper_candidates.sort(
-            key=lambda item: (-item["bbox"][3], item["bbox"][0])
-        )
-        for index, candidate in enumerate(paper_candidates, start=1):
-            candidate["index"] = index
-        return paper_candidates
+        return _finalize_formal_candidates(paper_candidates)
 
     insert_candidates, _, _ = _detect_insert_frames_with_families(doc)
     rectangle_candidates = detect_model_frames(doc)
@@ -1441,11 +1474,7 @@ def detect_frames(doc):
         if insert_candidates
         else _select_model_space_formal_candidates(rectangle_candidates, doc)
     )
-    candidates = _deduplicate_candidates(insert_candidates + model_candidates)
-    candidates.sort(key=lambda item: (-item["bbox"][3], item["bbox"][0]))
-    for index, candidate in enumerate(candidates, start=1):
-        candidate["index"] = index
-    return candidates
+    return _finalize_formal_candidates(insert_candidates + model_candidates)
 
 
 def detect_insert_frames(doc):
@@ -1469,12 +1498,17 @@ def detect_simple_frames(source: Path) -> dict:
         if insert_candidates or paper_space_candidates
         else _select_model_space_formal_candidates(rectangle_candidates, doc)
     )
-    frame_candidates = _deduplicate_candidates(
+    frame_candidates = _finalize_formal_candidates(
         paper_space_candidates + insert_candidates + model_frame_candidates
     )
-    frame_candidates.sort(key=lambda item: (-item["bbox"][3], item["bbox"][0]))
-    for index, candidate in enumerate(frame_candidates, start=1):
-        candidate["index"] = index
+    selected_frame_handles = {
+        candidate["entity_handle"] for candidate in frame_candidates
+    }
+    single_frame_candidates = [
+        candidate
+        for candidate in single_frame_candidates
+        if candidate["entity_handle"] in selected_frame_handles
+    ]
     inserts = list(doc.modelspace().query("INSERT"))
     return {
         "source": str(source),
