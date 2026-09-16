@@ -102,15 +102,31 @@ def _rectangle_candidate(entity):
         if abs(point[2]) > tolerance:
             return None
 
-    expected_corners = {
+    # Block transforms and DXF export can leave a mathematically rectangular
+    # polyline with tiny coordinate residue (for example, -2e-10 instead of
+    # 0).  Match each vertex to a different expected corner within the same
+    # geometric tolerance used above; do not accept missing or duplicated
+    # corners.
+    expected_corners = [
         (xmin, ymin),
         (xmin, ymax),
         (xmax, ymin),
         (xmax, ymax),
-    }
-    actual_corners = {(point[0], point[1]) for point in points}
-    if actual_corners != expected_corners:
-        return None
+    ]
+    matched_corners = set()
+    for point in points:
+        matching_corners = [
+            index
+            for index, corner in enumerate(expected_corners)
+            if abs(point[0] - corner[0]) <= tolerance
+            and abs(point[1] - corner[1]) <= tolerance
+        ]
+        if len(matching_corners) != 1:
+            return None
+        corner_index = matching_corners[0]
+        if corner_index in matched_corners:
+            return None
+        matched_corners.add(corner_index)
 
     raw_lineweight = _dxf_get(entity.dxf, "lineweight")
     try:
