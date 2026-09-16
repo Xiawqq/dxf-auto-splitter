@@ -930,11 +930,12 @@ _MODEL_CONTENT_RELATIVE_FLOOR = 0.25
 # only used when a drawing appears to contain a *set* of direct model-space
 # sheets while the INSERT route has produced a few likely internal objects.
 # A set-level conflict needs substantially more evidence than a single frame.
-_MODEL_FUSION_MAX_MARGIN_RATIO = 0.08
+_MODEL_FUSION_MAX_MARGIN_RATIO = 0.07
 _MODEL_FUSION_MIN_MODEL_CANDIDATES = 6
 _MODEL_FUSION_MIN_CONTENTFUL_CANDIDATES = 6
 _MODEL_FUSION_MAX_INSERT_CANDIDATES = 8
 _MODEL_FUSION_MIN_SET_MULTIPLIER = 3
+_MODEL_ADAPTIVE_MIN_ADDITIONAL_CANDIDATES = 3
 
 
 def _strictly_contains_rectangle(outer, inner) -> bool:
@@ -1610,12 +1611,71 @@ def _select_model_space_conflict_set(
     return model_candidates
 
 
+def _select_model_space_adaptive_set(
+    rectangle_candidates,
+    doc,
+    strict_candidates,
+):
+    """Use the second margin tier only for a coherent direct-frame set."""
+    relaxed_candidates = _select_model_space_formal_candidates(
+        rectangle_candidates,
+        doc,
+        max_margin_ratio=_MODEL_FUSION_MAX_MARGIN_RATIO,
+    )
+    relaxed_candidates = [
+        candidate
+        for candidate in relaxed_candidates
+        if candidate.get("border_pair")
+    ]
+    if len(relaxed_candidates) < _MODEL_FUSION_MIN_MODEL_CANDIDATES:
+        return []
+
+    additional_candidates = [
+        candidate
+        for candidate in relaxed_candidates
+        if not any(
+            _same_candidate_box(candidate, strict)
+            for strict in strict_candidates
+        )
+    ]
+    if len(additional_candidates) < _MODEL_ADAPTIVE_MIN_ADDITIONAL_CANDIDATES:
+        return []
+
+    contentful = [
+        candidate
+        for candidate in relaxed_candidates
+        if candidate.get("content_entity_count", 0)
+        > len(candidate.get("entity_handles") or [])
+        and candidate.get("content_coverage_ratio", 0.0)
+        >= _MODEL_CONTENT_MIN_COVERAGE
+    ]
+    if len(contentful) < _MODEL_FUSION_MIN_CONTENTFUL_CANDIDATES:
+        return []
+
+    for candidate in relaxed_candidates:
+        candidate["formal_group_role"] = "model_space_adaptive_set"
+        candidate["fusion_role"] = "model_space_set_added_second_tier_candidates"
+        candidate["adaptive_margin_ratio"] = _MODEL_FUSION_MAX_MARGIN_RATIO
+    return relaxed_candidates
+
+
 def _resolve_frame_candidate_sets(doc, insert_candidates, rectangle_candidates):
     """Choose the established route, with a guarded set-level conflict check."""
     if not insert_candidates:
+        strict_candidates = _select_model_space_formal_candidates(
+            rectangle_candidates,
+            doc,
+        )
+        adaptive_set = _select_model_space_adaptive_set(
+            rectangle_candidates,
+            doc,
+            strict_candidates,
+        )
+        if adaptive_set:
+            return [], adaptive_set, "model_space_adaptive_set"
         return (
             [],
-            _select_model_space_formal_candidates(rectangle_candidates, doc),
+            strict_candidates,
             "model_space_only",
         )
 
