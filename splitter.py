@@ -16,6 +16,7 @@ import shutil
 import ezdxf
 from ezdxf import bbox as ezdxf_bbox
 from ezdxf.entities.dxfentity import DXFTagStorage
+from ezdxf.xclip import XClip
 from ezdxf.xref import ConflictPolicy, Loader
 
 from audit import _dxf_get, _load_document
@@ -634,6 +635,366 @@ def _block_name(entity):
     return _dxf_get(entity.dxf, "name") or ""
 
 
+# A few CAD applications store several visually unrelated note panels in one
+# reusable block definition.  Treating every INSERT as indivisible is still
+# the safe default; this narrow profile is only enabled for a block that is
+# demonstrably a large, text-heavy collection of spatially separated groups.
+_COMPOUND_BLOCK_MIN_ENTITIES = 100
+_COMPOUND_BLOCK_MIN_TEXT_ENTITIES = 80
+_COMPOUND_BLOCK_MIN_TEXT_RATIO = 0.25
+_COMPOUND_BLOCK_MIN_CLUSTERS = 4
+_COMPOUND_BLOCK_MAX_CLUSTERS = 30
+_COMPOUND_BLOCK_MAX_LARGEST_CLUSTER_RATIO = 0.35
+_COMPOUND_BLOCK_GAP_FRACTION = 0.005
+_COMPOUND_BLOCK_GAP_LIMIT = 2000.0
+
+
+def _source_block_by_name(source_doc, block_name):
+    """Return an exact block-name match before using ezdxf's name lookup."""
+    for block in source_doc.blocks:
+        if block.name == block_name:
+            return block
+    try:
+        return source_doc.blocks.get(block_name)
+    except Exception:
+        return None
+
+
+def _finite_entity_bbox(entity):
+    """Return a finite entity bbox, or None for unsupported/empty geometry."""
+    entity_box = _entity_bbox(entity)
+    if entity_box is None:
+        return None
+    if not all(math.isfinite(float(value)) for value in entity_box):
+        return None
+    return entity_box
+
+
+def _compound_block_groups(source_doc, block_name):
+    """Find safe spatial groups inside a demonstrably compound block.
+
+    This is intentionally conservative.  A block is eligible only when it
+    contains many entities, a substantial text population, and several
+    well-separated spatial groups.  Ordinary structural/detail blocks usually
+    form one connected group and therefore stay on the normal INSERT path.
+    """
+    block = _source_block_by_name(source_doc, block_name)
+    if block is None:
+        return None
+
+    children = list(block)
+    if len(children) < _COMPOUND_BLOCK_MIN_ENTITIES:
+        return None
+
+    text_count = sum(
+        1 for child in children if child.dxftype() in _TEXT_ENTITY_TYPES
+    )
+    if (
+        text_count < _COMPOUND_BLOCK_MIN_TEXT_ENTITIES
+        or text_count / max(1, len(children)) < _COMPOUND_BLOCK_MIN_TEXT_RATIO
+    ):
+        return None
+
+    valid_items = []
+    invalid_children = []
+    for child in children:
+        child_box = _finite_entity_bbox(child)
+        if child_box is None:
+            invalid_children.append(child)
+        else:
+            valid_items.append((child, child_box))
+
+    if len(valid_items) < _COMPOUND_BLOCK_MIN_ENTITIES:
+        return None
+
+    full_box = [
+        min(item[1][0] for item in valid_items),
+        min(item[1][1] for item in valid_items),
+        max(item[1][2] for item in valid_items),
+        max(item[1][3] for item in valid_items),
+    ]
+    full_width = max(0.0, full_box[2] - full_box[0])
+    full_height = max(0.0, full_box[3] - full_box[1])
+    gap_limit = min(
+        max(full_width, full_height) * _COMPOUND_BLOCK_GAP_FRACTION,
+        _COMPOUND_BLOCK_GAP_LIMIT,
+    )
+
+    parent = list(range(len(valid_items)))
+
+    def find(index):
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+
+    def union(first, second):
+        first = find(first)
+        second = find(second)
+        if first != second:
+            parent[second] = first
+
+    def bbox_gap(first, second):
+        return max(
+            0.0,
+            second[0] - first[2],
+            first[0] - second[2],
+            second[1] - first[3],
+            first[1] - second[3],
+        )
+
+    for first in range(len(valid_items)):
+        for second in range(first + 1, len(valid_items)):
+            if bbox_gap(valid_items[first][1], valid_items[second][1]) <= gap_limit:
+                union(first, second)
+
+    grouped_positions = {}
+    for index in range(len(valid_items)):
+        grouped_positions.setdefault(find(index), []).append(index)
+
+    groups = []
+    for member_indexes in grouped_positions.values():
+        group_children = [valid_items[index][0] for index in member_indexes]
+        group_box = [
+            min(valid_items[index][1][0] for index in member_indexes),
+            min(valid_items[index][1][1] for index in member_indexes),
+            max(valid_items[index][1][2] for index in member_indexes),
+            max(valid_items[index][1][3] for index in member_indexes),
+        ]
+        groups.append({"children": group_children, "bbox": group_box})
+
+    groups.sort(
+        key=lambda group: (
+            -group["bbox"][1],
+            group["bbox"][0],
+        )
+    )
+
+    full_area = max(0.0, full_width * full_height)
+    largest_group_area = max(
+        (
+            max(0.0, group["bbox"][2] - group["bbox"][0])
+            * max(0.0, group["bbox"][3] - group["bbox"][1])
+            for group in groups
+        ),
+        default=0.0,
+    )
+    if not (
+        _COMPOUND_BLOCK_MIN_CLUSTERS
+        <= len(groups)
+        <= _COMPOUND_BLOCK_MAX_CLUSTERS
+        and full_area > 0.0
+        and largest_group_area / full_area
+        <= _COMPOUND_BLOCK_MAX_LARGEST_CLUSTER_RATIO
+    ):
+        return None
+
+    # Empty/unsupported child geometry must not disappear.  Keep it in a
+    # residual part which will conservatively go to shared content.
+    if invalid_children:
+        groups.append({"children": invalid_children, "bbox": None})
+
+    return groups
+
+
+def _clone_block_children(target_block, children):
+    """Copy child entities into a synthetic block without source handles."""
+    for child in children:
+        # DXFEntity.copy() avoids copying the whole source document graph;
+        # deepcopy() is prohibitively slow for entities owned by a document.
+        clone = child.copy()
+        for attribute in ("handle", "owner"):
+            try:
+                setattr(clone.dxf, attribute, None)
+            except (AttributeError, TypeError, ValueError):
+                pass
+        target_block.add_entity(clone)
+
+
+def _copy_insert_attributes(source_insert, target_insert):
+    """Copy visual INSERT attributes while keeping target ownership fields."""
+    for name, value in source_insert.dxfattribs().items():
+        if name in {"handle", "owner", "name", "insert"}:
+            continue
+        try:
+            target_insert.dxf.set(name, copy.deepcopy(value))
+        except (AttributeError, TypeError, ValueError):
+            continue
+
+
+_UNSUPPORTED_COMPOUND_CLIP = object()
+
+
+def _compound_insert_clip_box(source_insert):
+    """Return an INSERT's clipping box in block coordinates.
+
+    The boundary stored by a SPATIAL_FILTER is not necessarily already in
+    block coordinates.  XClip applies the inverse INSERT matrix for us.  A
+    non-rectangular or inverted clipping path is deliberately left to the
+    original INSERT path instead of guessing and changing its visible result.
+    """
+    try:
+        xclip = XClip(source_insert)
+        spatial_filter = xclip.get_spatial_filter()
+        if spatial_filter is None or not xclip.is_clipping_enabled:
+            return None
+        clipping_path = xclip.get_block_clipping_path()
+        if clipping_path.is_inverted_clip:
+            return _UNSUPPORTED_COMPOUND_CLIP
+        vertices = list(clipping_path.vertices)
+        if len(vertices) < 3:
+            return _UNSUPPORTED_COMPOUND_CLIP
+        values = [
+            (float(vertex.x), float(vertex.y)) for vertex in vertices
+        ]
+        if not all(math.isfinite(value) for pair in values for value in pair):
+            return _UNSUPPORTED_COMPOUND_CLIP
+        return [
+            min(pair[0] for pair in values),
+            min(pair[1] for pair in values),
+            max(pair[0] for pair in values),
+            max(pair[1] for pair in values),
+        ]
+    except Exception:
+        # A malformed filter must not make the whole source file fail.  Keep
+        # that INSERT indivisible and let the established path handle it.
+        return _UNSUPPORTED_COMPOUND_CLIP
+
+
+def _bbox_intersects(first, second):
+    return not (
+        first[2] < second[0]
+        or second[2] < first[0]
+        or first[3] < second[1]
+        or second[3] < first[1]
+    )
+
+
+def _compound_parts_for_clip(source_doc, groups, clip_box, counter):
+    """Create filter-aware synthetic blocks without copying the filter."""
+    generated_parts = []
+    for group in groups:
+        if clip_box is None or group["bbox"] is None:
+            selected_children = list(group["children"])
+        elif not _bbox_intersects(group["bbox"], clip_box):
+            continue
+        else:
+            selected_children = []
+            for child in group["children"]:
+                child_box = _finite_entity_bbox(child)
+                if child_box is None or _bbox_intersects(child_box, clip_box):
+                    selected_children.append(child)
+            if not selected_children:
+                continue
+
+        generated_block_name = f"__DXF_SPLIT_COMPOUND_{counter:04d}"
+        counter += 1
+        generated_block = source_doc.blocks.new(
+            name=generated_block_name,
+            base_point=(0.0, 0.0, 0.0),
+        )
+        _clone_block_children(generated_block, selected_children)
+        generated_parts.append(
+            {
+                "block_name": generated_block_name,
+                "bbox": group["bbox"],
+            }
+        )
+    return generated_parts, counter
+
+
+def _expand_compound_block_inserts(source_doc):
+    """Replace only confirmed compound INSERTs with spatial child INSERTs.
+
+    The source file is never saved after this in-memory transformation.  Each
+    generated INSERT references a synthetic block containing one spatial group
+    from the original definition, so the existing entity classification and
+    export path can remain unchanged for every other entity.
+    """
+    modelspace = source_doc.modelspace()
+    original_count = len(modelspace)
+    compound_cache = {}
+    generated_parts_cache = {}
+    replacements = []
+    generated_block_counter = 0
+
+    source_inserts = [
+        entity for entity in list(modelspace) if entity.dxftype() == "INSERT"
+    ]
+    for source_insert in source_inserts:
+        block_name = _block_name(source_insert)
+        if not block_name:
+            continue
+        if block_name not in compound_cache:
+            groups = _compound_block_groups(source_doc, block_name)
+            compound_cache[block_name] = groups
+        groups = compound_cache[block_name]
+        if not groups:
+            continue
+
+        clip_box = _compound_insert_clip_box(source_insert)
+        if clip_box is _UNSUPPORTED_COMPOUND_CLIP:
+            continue
+
+        clip_key = None if clip_box is None else tuple(
+            round(value, 6) for value in clip_box
+        )
+        parts_key = (block_name, clip_key)
+        if parts_key not in generated_parts_cache:
+            generated_parts, generated_block_counter = _compound_parts_for_clip(
+                source_doc,
+                groups,
+                clip_box,
+                generated_block_counter,
+            )
+            generated_parts_cache[parts_key] = generated_parts
+        generated_parts = generated_parts_cache[parts_key]
+        if not generated_parts:
+            continue
+
+        created_handles = []
+        for part in generated_parts:
+            # Create a clean INSERT deliberately.  Copying the source INSERT
+            # would also copy SPATIAL_FILTER and make every child part render
+            # its own white clipping rectangle.
+            generated_insert = modelspace.add_blockref(
+                part["block_name"],
+                insert=source_insert.dxf.insert,
+            )
+            _copy_insert_attributes(source_insert, generated_insert)
+            created_handles.append(generated_insert.dxf.handle)
+
+        source_handle = _dxf_get(source_insert.dxf, "handle") or ""
+        modelspace.delete_entity(source_insert)
+        replacements.append(
+            {
+                "source_handle": source_handle,
+                "source_block_name": block_name,
+                "part_count": len(generated_parts),
+                "generated_handles": created_handles,
+            }
+        )
+
+    if not replacements:
+        return {
+            "original_model_entity_count": original_count,
+            "expanded_model_entity_count": original_count,
+            "replaced_insert_count": 0,
+            "generated_part_count": 0,
+            "replacements": [],
+        }
+
+    return {
+        "original_model_entity_count": original_count,
+        "expanded_model_entity_count": len(modelspace),
+        "replaced_insert_count": len(replacements),
+        "generated_part_count": sum(
+            replacement["part_count"] for replacement in replacements
+        ),
+        "replacements": replacements,
+    }
+
+
 def _insert_export_issue(source_doc, entity):
     """Return a reason when an INSERT cannot be safely copied to a new DXF."""
     if entity.dxftype() != "INSERT":
@@ -1138,6 +1499,8 @@ def split_dxf(source: Path, output_dir: Path) -> dict:
         return _split_single_frame_as_source(
             source, output_dir, doc, frames, load_info
         )
+    original_model_entity_count = len(doc.modelspace())
+    compound_expansion = _expand_compound_block_inserts(doc)
     classification = classify_model_entities(doc, frames)
     classification = _retain_frame_boundary_entities(doc, frames, classification)
     paper_layouts_by_name = {
@@ -1158,6 +1521,12 @@ def split_dxf(source: Path, output_dir: Path) -> dict:
     classification["allocation_stats"] = _build_allocation_stats(
         doc, classification
     )
+    classification["allocation_stats"][
+        "original_source_model_entity_count"
+    ] = original_model_entity_count
+    classification["allocation_stats"][
+        "expanded_source_model_entity_count"
+    ] = len(doc.modelspace())
     outputs = []
 
     for frame in frames:
@@ -1216,9 +1585,15 @@ def split_dxf(source: Path, output_dir: Path) -> dict:
         "output_dir": str(output_dir),
         "load": load_info,
         "frame_count": len(frames),
+        "original_model_entity_count": original_model_entity_count,
+        "expanded_model_entity_count": len(doc.modelspace()),
+        "compound_expansion": compound_expansion,
         "frames": frames,
         "classification": {
             "model_entity_count": classification["model_entity_count"],
+            "original_model_entity_count": original_model_entity_count,
+            "expanded_model_entity_count": len(doc.modelspace()),
+            "compound_expansion": compound_expansion,
             "status_counts": classification["status_counts"],
             "boundary_category_counts": classification["boundary_category_counts"],
             "review_records": classification["review_records"],
@@ -1234,13 +1609,22 @@ def split_dxf(source: Path, output_dir: Path) -> dict:
 
 def split_report_markdown(report: dict) -> str:
     classification = report["classification"]
+    original_model_entity_count = report.get(
+        "original_model_entity_count",
+        classification["model_entity_count"],
+    )
+    expanded_model_entity_count = report.get(
+        "expanded_model_entity_count",
+        classification["model_entity_count"],
+    )
     lines = [
         "# DXF 分割报告",
         "",
         f"- 源文件：`{report['source']}`",
         f"- 输出目录：`{report['output_dir']}`",
         f"- 图框数量：{report['frame_count']}",
-        f"- 模型空间实体总数：{classification['model_entity_count']}",
+        f"- 原始模型空间实体总数：{original_model_entity_count}",
+        f"- 分割归属实体单元数：{expanded_model_entity_count}",
         f"- 读取方式：{report['load']['mode']}，结构修复次数：{report['load']['repairs']}",
         "",
         "> 本次采用保守归属：完整落入图框的实体进入对应文件；跨边界、无法定位和图框外实体进入共享内容。无法安全复制的异常块实体会单独记录，不让它拖垮整个导出。",
@@ -1275,10 +1659,22 @@ def split_report_markdown(report: dict) -> str:
             "## 结构保留与实体归属核查",
             "",
             "- 纸空间布局不会被默认丢弃；已关联图框的布局进入对应图框文件，未关联布局进入共享内容。",
-            f"- 源模型空间实体：{allocation.get('source_model_entity_count', 0)}；目标文件唯一归属实体：{allocation.get('unique_destination_entity_count', 0)}。",
+            f"- 原始模型空间实体：{allocation.get('original_source_model_entity_count', allocation.get('source_model_entity_count', 0))}；展开后归属单元：{allocation.get('expanded_source_model_entity_count', allocation.get('source_model_entity_count', 0))}；目标文件唯一归属实体：{allocation.get('unique_destination_entity_count', 0)}。",
             f"- 重复归属实体：{allocation.get('duplicated_entity_count', 0)}；未归属实体：{allocation.get('unassigned_entity_count', 0)}。",
         ]
     )
+    compound_expansion = report.get("compound_expansion") or {}
+    if compound_expansion.get("replaced_insert_count", 0):
+        lines.extend(
+            [
+                "",
+                "## 复合块展开",
+                "",
+                f"- 替换复合 INSERT：{compound_expansion['replaced_insert_count']} 个；",
+                f"- 展开后的内部归属单元：{compound_expansion['generated_part_count']} 个；",
+                "- 仅对满足多区域、文本密集和空间分离条件的复合块启用，普通 INSERT 不展开。",
+            ]
+        )
     for output in report["outputs"]:
         lines.append(
             f"- `{Path(output['path']).name}`：模型空间 {output.get('output_entity_count', 0)} 个，"
