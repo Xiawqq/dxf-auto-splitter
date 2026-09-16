@@ -910,6 +910,16 @@ _MODEL_BORDER_MAX_ASPECT_DELTA = 0.10
 _MODEL_CONTENT_MIN_COVERAGE = 0.05
 _MODEL_CONTENT_RELATIVE_FLOOR = 0.25
 
+# The normal route above deliberately remains strict.  These thresholds are
+# only used when a drawing appears to contain a *set* of direct model-space
+# sheets while the INSERT route has produced a few likely internal objects.
+# A set-level conflict needs substantially more evidence than a single frame.
+_MODEL_FUSION_MAX_MARGIN_RATIO = 0.08
+_MODEL_FUSION_MIN_MODEL_CANDIDATES = 6
+_MODEL_FUSION_MIN_CONTENTFUL_CANDIDATES = 6
+_MODEL_FUSION_MAX_INSERT_CANDIDATES = 8
+_MODEL_FUSION_MIN_SET_MULTIPLIER = 3
+
 
 def _strictly_contains_rectangle(outer, inner) -> bool:
     return (
@@ -920,7 +930,11 @@ def _strictly_contains_rectangle(outer, inner) -> bool:
     )
 
 
-def _model_border_pair(outer, inner):
+def _model_border_pair(
+    outer,
+    inner,
+    max_margin_ratio=_MODEL_BORDER_MAX_MARGIN_RATIO,
+):
     """Find a nearby thin outer border for an explicit-width inner border."""
     if not _strictly_contains_rectangle(outer["bbox"], inner["bbox"]):
         return None
@@ -939,7 +953,7 @@ def _model_border_pair(outer, inner):
     if min(margins) <= 0:
         return None
 
-    if max(margins) / min(inner_width, inner_height) > _MODEL_BORDER_MAX_MARGIN_RATIO:
+    if max(margins) / min(inner_width, inner_height) > max_margin_ratio:
         return None
 
     aspect_delta = abs(outer["aspect_ratio"] - inner["aspect_ratio"])
@@ -1380,7 +1394,11 @@ def _content_supported_geometry_fallback(rectangle_candidates):
     return result
 
 
-def _select_model_space_formal_candidates(rectangle_candidates, doc=None):
+def _select_model_space_formal_candidates(
+    rectangle_candidates,
+    doc=None,
+    max_margin_ratio=_MODEL_BORDER_MAX_MARGIN_RATIO,
+):
     """Select model-space frames by border groups and non-nesting semantics."""
     explicit = [
         candidate
@@ -1396,7 +1414,13 @@ def _select_model_space_formal_candidates(rectangle_candidates, doc=None):
         pairs = [
             pair
             for outer in rectangle_candidates
-            if (pair := _model_border_pair(outer, inner)) is not None
+            if (
+                pair := _model_border_pair(
+                    outer,
+                    inner,
+                    max_margin_ratio=max_margin_ratio,
+                )
+            ) is not None
         ]
         if not pairs:
             continue
@@ -1503,6 +1527,102 @@ def _select_model_space_formal_candidates(rectangle_candidates, doc=None):
     return _deduplicate_candidates(_drop_nested_formal_candidates(formal_candidates))
 
 
+def _select_model_space_conflict_set(
+    rectangle_candidates,
+    doc,
+    insert_candidates,
+):
+    """Return a direct-frame set only when it convincingly beats weak INSERTs.
+
+    This is intentionally a narrow override.  It is designed for drawings
+    such as BaoTou where many formal sheets are drawn directly in model space,
+    while a handful of internal INSERTs happen to contain border-like tracks.
+    Ordinary INSERT-based drawings keep their established route unless this
+    whole-set evidence is present.
+    """
+    insert_count = len(insert_candidates)
+    if insert_count == 0 or insert_count > _MODEL_FUSION_MAX_INSERT_CANDIDATES:
+        return []
+
+    model_candidates = _select_model_space_formal_candidates(
+        rectangle_candidates,
+        doc,
+        max_margin_ratio=_MODEL_FUSION_MAX_MARGIN_RATIO,
+    )
+    # The relaxed margin is only for finding paired outer/inner borders.  Do
+    # not let a standalone thick rectangle or geometry-only fallback trigger
+    # the override.
+    model_candidates = [
+        candidate
+        for candidate in model_candidates
+        if candidate.get("border_pair")
+    ]
+    required_count = max(
+        _MODEL_FUSION_MIN_MODEL_CANDIDATES,
+        insert_count * _MODEL_FUSION_MIN_SET_MULTIPLIER,
+    )
+    if len(model_candidates) < required_count:
+        return []
+
+    contentful = [
+        candidate
+        for candidate in model_candidates
+        if candidate.get("content_entity_count", 0)
+        > len(candidate.get("entity_handles") or [])
+        and candidate.get("content_coverage_ratio", 0.0)
+        >= _MODEL_CONTENT_MIN_COVERAGE
+    ]
+    if len(contentful) < _MODEL_FUSION_MIN_CONTENTFUL_CANDIDATES:
+        return []
+
+    # The weak INSERT candidates must be inside the direct-frame set.  If an
+    # INSERT is elsewhere, it may be a legitimate sheet and must be retained.
+    insert_handles = [candidate["entity_handle"] for candidate in insert_candidates]
+    if not all(
+        any(
+            _strictly_contains_rectangle(model["bbox"], insert["bbox"])
+            for model in model_candidates
+        )
+        for insert in insert_candidates
+    ):
+        return []
+
+    for candidate in model_candidates:
+        candidate["formal_group_role"] = "model_space_set_conflict_override"
+        candidate["fusion_role"] = "model_space_set_overrode_insert_candidates"
+        candidate["overridden_insert_handles"] = list(insert_handles)
+    return model_candidates
+
+
+def _resolve_frame_candidate_sets(doc, insert_candidates, rectangle_candidates):
+    """Choose the established route, with a guarded set-level conflict check."""
+    if not insert_candidates:
+        return (
+            [],
+            _select_model_space_formal_candidates(rectangle_candidates, doc),
+            "model_space_only",
+        )
+
+    conflict_set = _select_model_space_conflict_set(
+        rectangle_candidates,
+        doc,
+        insert_candidates,
+    )
+    if not conflict_set:
+        return insert_candidates, [], "insert_primary"
+
+    conflict_boxes = [candidate["bbox"] for candidate in conflict_set]
+    retained_inserts = [
+        candidate
+        for candidate in insert_candidates
+        if not any(
+            _strictly_contains_rectangle(box, candidate["bbox"])
+            for box in conflict_boxes
+        )
+    ]
+    return retained_inserts, conflict_set, "model_space_set_override"
+
+
 def detect_frames(doc):
     """Detect formal candidates from paper space before model space."""
     paper_candidates = _paper_layout_frame_candidates(doc)
@@ -1511,14 +1631,10 @@ def detect_frames(doc):
 
     insert_candidates, _, _ = _detect_insert_frames_with_families(doc)
     rectangle_candidates = detect_model_frames(doc)
-    # A drawing normally uses one dominant frame representation.  Keep the
-    # established INSERT route primary; use direct model-space frames only
-    # when no INSERT frame was found, so local thick rectangles in a block-
-    # based drawing do not create extra formal frames.
-    model_candidates = (
-        []
-        if insert_candidates
-        else _select_model_space_formal_candidates(rectangle_candidates, doc)
+    insert_candidates, model_candidates, _ = _resolve_frame_candidate_sets(
+        doc,
+        insert_candidates,
+        rectangle_candidates,
     )
     return _finalize_formal_candidates(insert_candidates + model_candidates)
 
@@ -1539,11 +1655,17 @@ def detect_simple_frames(source: Path) -> dict:
         else _detect_insert_frames_with_families(doc)
     )
     rectangle_candidates = detect_model_frames(doc)
-    model_frame_candidates = (
-        []
-        if insert_candidates or paper_space_candidates
-        else _select_model_space_formal_candidates(rectangle_candidates, doc)
-    )
+    fusion_mode = "paperspace_primary" if paper_space_candidates else ""
+    if not paper_space_candidates:
+        insert_candidates, model_frame_candidates, fusion_mode = (
+            _resolve_frame_candidate_sets(
+                doc,
+                insert_candidates,
+                rectangle_candidates,
+            )
+        )
+    else:
+        model_frame_candidates = []
     frame_candidates = _finalize_formal_candidates(
         paper_space_candidates + insert_candidates + model_frame_candidates
     )
@@ -1572,6 +1694,7 @@ def detect_simple_frames(source: Path) -> dict:
         "model_insert_count": len(inserts),
         "insert_families": insert_families,
         "single_frame_candidates": single_frame_candidates,
+        "fusion_mode": fusion_mode,
     }
 
 
