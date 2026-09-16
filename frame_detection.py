@@ -392,11 +392,32 @@ def _close_parallel_track(pair):
     return max(pair["margins"]) / reference_size <= 0.02
 
 
-def _block_border_profile(doc, block_name):
-    """查找块定义中的连续嵌套矩形，以及内框线宽证据。"""
+def _get_block_definition(doc, block_name):
+    """Resolve block names exactly, including anonymous names containing '$'."""
+    for block in doc.blocks:
+        if getattr(block, "name", None) == block_name:
+            return block
     try:
-        block = doc.blocks.get(block_name)
+        return doc.blocks.get(block_name)
     except Exception:
+        return None
+
+
+def _block_border_profile(doc, block_name, _visited=None):
+    """查找块定义中的连续嵌套矩形，以及内框线宽证据。"""
+    visited = set(_visited or ())
+    if block_name in visited:
+        return {
+            "nested_border": False,
+            "thick_inner": False,
+            "parallel_track": False,
+            "nested_depth": 0,
+            "border_evidence": "none",
+            "pair": None,
+        }
+    visited.add(block_name)
+    block = _get_block_definition(doc, block_name)
+    if block is None:
         return {
             "nested_border": False,
             "thick_inner": False,
@@ -466,6 +487,34 @@ def _block_border_profile(doc, block_name):
         pair["parallel_track_evidence"] = _close_parallel_track(pair)
 
     if not pairs:
+        nested_profiles = []
+        for entity in block.query("INSERT"):
+            nested_name = str(entity.dxf.get("name") or "")
+            if not nested_name:
+                continue
+            nested_profile = _block_border_profile(
+                doc, nested_name, _visited=visited
+            )
+            if nested_profile.get("nested_border"):
+                nested_profiles.append(nested_profile)
+        if nested_profiles:
+            nested_profile = max(
+                nested_profiles,
+                key=lambda profile: (
+                    bool(profile.get("thick_inner")),
+                    bool(profile.get("parallel_track")),
+                    profile.get("nested_depth", 0),
+                ),
+            )
+            nested_profile = dict(nested_profile)
+            nested_profile["nested_depth"] = (
+                nested_profile.get("nested_depth", 0) + 1
+            )
+            nested_profile["border_evidence"] = (
+                "nested_insert_" + nested_profile.get("border_evidence", "none")
+            )
+            nested_profile["nested_insert"] = True
+            return nested_profile
         return {
             "nested_border": False,
             "thick_inner": False,
@@ -585,10 +634,7 @@ def _deduplicate_candidates(candidates):
 
 def _single_frame_shape(doc, block_name):
     """提取单次 INSERT 的最外层矩形和一个内部矩形，不读取文字语义。"""
-    try:
-        block = doc.blocks.get(block_name)
-    except Exception:
-        return None
+    block = _get_block_definition(doc, block_name)
     if block is None:
         return None
 
